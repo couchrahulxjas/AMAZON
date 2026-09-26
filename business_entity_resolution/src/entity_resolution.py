@@ -30,9 +30,8 @@ from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz, distance
+from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import HistGradientBoostingClassifier
 from tqdm import tqdm
 
@@ -100,8 +99,10 @@ def normalize_unicode(text: str) -> str:
     if not isinstance(text, str):
         return ""
     try:
-        normalized = unicodedata.normalize("NFKD", text)
-        return normalized.encode("ascii", "ignore").decode("ascii")
+        # Keep Devanagari/Kannada/etc. RapidFuzz and Python's Unicode-aware
+        # tokenisation can compare them; ASCII encoding silently turned an
+        # informative business name into an empty string.
+        return unicodedata.normalize("NFKC", text)
     except Exception:
         return text
 
@@ -125,7 +126,8 @@ def normalize_address(addr: str) -> str:
     if not isinstance(addr, str) or not addr.strip():
         return ""
     text = normalize_unicode(addr).lower().strip()
-    text = re.sub(r"[^\w\s,]", " ", text)
+    # Commas must be separators, not part of a token ("delhi," != "delhi").
+    text = re.sub(r"[^\w\s]", " ", text)
     for pattern, replacement in ADDRESS_ABBREV:
         text = re.sub(pattern, replacement, text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -185,7 +187,7 @@ def load_source(path: Path) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────
 
 class BlockingPipeline:
-    MAX_POSTING_LIST_SIZE = 500
+    MAX_POSTING_LIST_SIZE = 1_000
     PREFIX_LEN = 4
     TFIDF_TOP_K = 50
     MAX_CANDIDATES_PER_S1 = 80
@@ -194,12 +196,16 @@ class BlockingPipeline:
         self.s1  = s1.reset_index(drop=True)
         self.s23 = s23.reset_index(drop=True)
 
-    def _build_token_index(self) -> Dict[str, List[int]]:
-        log.info("Building inverted token index on S2/S3 ...")
-        idx: Dict[str, List[int]] = collections.defaultdict(list)
-        for i, row in enumerate(self.s23["norm_name"]):
-            for token in extract_tokens(row):
-                idx[token].append(i)
+    def _build_token_index(self) -> Dict[Tuple[str, str, str], List[int]]:
+        """Index both fields within country; address-led links are common here."""
+        log.info("Building country-aware name/address token index on S2/S3 ...")
+        idx: Dict[Tuple[str, str, str], List[int]] = collections.defaultdict(list)
+        for i, row in enumerate(self.s23[["country", "norm_name", "norm_addr"]].itertuples(index=False)):
+            country, name, address = row
+            for token in extract_tokens(name):
+                idx[(country, "name", token)].append(i)
+            for token in extract_tokens(address):
+                idx[(country, "address", token)].append(i)
         pruned = {
             tok: ids
             for tok, ids in idx.items()
@@ -208,22 +214,24 @@ class BlockingPipeline:
         log.info(f"  Token index: {len(pruned):,} tokens after pruning")
         return pruned
 
-    def _token_blocking(self, token_idx: Dict[str, List[int]]) -> Dict[str, Set[str]]:
+    def _token_blocking(self, token_idx: Dict[Tuple[str, str, str], List[int]]) -> Dict[str, Set[str]]:
         log.info("Running token blocking ...")
         s23_ids = self.s23["entity_id"].values
         candidates: Dict[str, Set[str]] = {eid: set() for eid in self.s1["entity_id"]}
         s1_ids   = self.s1["entity_id"].values
         s1_names = self.s1["norm_name"].values
+        s1_addrs = self.s1["norm_addr"].values
+        s1_countries = self.s1["country"].values
 
-        for i, (s1_id, name) in enumerate(
-            tqdm(zip(s1_ids, s1_names), total=len(s1_ids), desc="Token blocking")
+        for s1_id, country, name, address in tqdm(
+            zip(s1_ids, s1_countries, s1_names, s1_addrs), total=len(s1_ids), desc="Token blocking"
         ):
-            for token in extract_tokens(name):
-                if token in token_idx:
-                    for j in token_idx[token]:
-                        candidates[s1_id].add(s23_ids[j])
-                        if len(candidates[s1_id]) >= self.MAX_CANDIDATES_PER_S1 * 3:
-                            break
+            for field, text in (("name", name), ("address", address)):
+                for token in extract_tokens(text):
+                    posting = token_idx.get((country, field, token))
+                    if posting:
+                        for j in posting:
+                            candidates[s1_id].add(s23_ids[j])
         return candidates
 
     def _prefix_blocking(self) -> Dict[str, Set[str]]:
@@ -262,28 +270,37 @@ class BlockingPipeline:
 
         s1_ids  = self.s1["entity_id"].values
         s23_ids = self.s23["entity_id"].values
+        s1_countries = self.s1["country"].values
+        s23_countries = self.s23["country"].values
         candidates: Dict[str, Set[str]] = {eid: set() for eid in s1_ids}
-        s23_T = s23_matrix.T
         BATCH = 1000
 
-        for start in tqdm(range(0, n_s1, BATCH), desc="TF-IDF blocking"):
-            end   = min(start + BATCH, n_s1)
-            batch = s1_matrix[start:end]
-            # Do not call .toarray(): with real challenge data that would create
-            # a multi-gigabyte dense matrix for every batch.  Sparse products
-            # retain only overlapping character n-grams, then we select top-k.
-            sims = (batch @ s23_T).tocsr()
-            for bi, gi in enumerate(range(start, end)):
-                start_i, end_i = sims.indptr[bi], sims.indptr[bi + 1]
-                indices, values = sims.indices[start_i:end_i], sims.data[start_i:end_i]
-                if not len(values):
-                    continue
-                keep = min(self.TFIDF_TOP_K, len(values))
-                selected = np.argpartition(values, -keep)[-keep:]
-                s1_id = s1_ids[gi]
-                for loc in selected:
-                    if values[loc] > 0.05:
-                        candidates[s1_id].add(s23_ids[indices[loc]])
+        # Entity identity cannot cross countries in the supplied labels.  Search
+        # within each observed country so unrelated records cannot displace a
+        # correct candidate from the top-K list.  This remains open-set: France
+        # works without being named or trained as a special case.
+        for country in tqdm(np.unique(s1_countries), desc="Country TF-IDF blocking"):
+            left_positions = np.flatnonzero(s1_countries == country)
+            right_positions = np.flatnonzero(s23_countries == country)
+            if not len(right_positions):
+                continue
+            country_right_T = s23_matrix[right_positions].T
+            for start in range(0, len(left_positions), BATCH):
+                positions = left_positions[start:start + BATCH]
+                batch = s1_matrix[positions]
+                # Do not densify this product; overlap-only sparse rows are safe.
+                sims = (batch @ country_right_T).tocsr()
+                for bi, gi in enumerate(positions):
+                    start_i, end_i = sims.indptr[bi], sims.indptr[bi + 1]
+                    indices, values = sims.indices[start_i:end_i], sims.data[start_i:end_i]
+                    if not len(values):
+                        continue
+                    keep = min(self.TFIDF_TOP_K, len(values))
+                    selected = np.argpartition(values, -keep)[-keep:]
+                    s1_id = s1_ids[gi]
+                    for loc in selected:
+                        if values[loc] > 0.05:
+                            candidates[s1_id].add(s23_ids[right_positions[indices[loc]]])
         return candidates
 
     def generate_candidates(self) -> Dict[str, Set[str]]:
@@ -653,22 +670,27 @@ def run_pipeline(mode: str = "test") -> None:
             matched = row.matched_entity_ids
             ground_truth_tr[s1_id] = set(matched.split(",")) if matched.strip() else set()
 
-        # Train blocking + features.  The labelled positives are always included
-        # during fitting: otherwise a blocking miss would silently turn a known
-        # match into a negative training example.
+        # Split by S1 entity before injecting known training positives.  Holding
+        # validation candidates to the real blocker makes threshold selection an
+        # honest estimate of the score ceiling at test time.
+        all_keys = list(ground_truth_tr.keys())
+        np.random.seed(42)
+        np.random.shuffle(all_keys)
+        split = int(0.8 * len(all_keys))
+        val_ids = set(all_keys[split:])
+
+        # Train blocking + features. Positives are inserted only into the
+        # training fold, preventing a blocking miss from becoming a false
+        # negative while avoiding validation leakage.
         blocker_tr = BlockingPipeline(s1_tr, s23_tr)
         cands_tr   = blocker_tr.generate_candidates()
         valid_train_ids = set(s23_tr["entity_id"])
         for source_id, matched_ids in ground_truth_tr.items():
-            cands_tr.setdefault(source_id, set()).update(matched_ids & valid_train_ids)
+            if source_id not in val_ids:
+                cands_tr.setdefault(source_id, set()).update(matched_ids & valid_train_ids)
         X_tr, y_tr, pairs_tr = build_feature_matrix(s1_tr, s23_tr, cands_tr, ground_truth_tr)
 
-        # Quick val split for threshold tuning (20% of train)
-        all_keys = list(ground_truth_tr.keys())
-        np.random.seed(42)
-        np.random.shuffle(all_keys)
-        split   = int(0.8 * len(all_keys))
-        val_ids = set(all_keys[split:])
+        # Entity-disjoint validation for threshold tuning (20% of training S1).
         pairs_val_filter = [(i, p) for i, p in enumerate(pairs_tr) if p[0] in val_ids]
         if pairs_val_filter and len(all_keys) >= 5:
             val_indices, pairs_val = zip(*pairs_val_filter)
