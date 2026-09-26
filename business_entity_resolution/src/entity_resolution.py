@@ -33,7 +33,7 @@ import pandas as pd
 from rapidfuzz import fuzz, distance
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder
-import xgboost as xgb
+from sklearn.ensemble import HistGradientBoostingClassifier
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -44,7 +44,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # PATHS
-BASE_DIR = Path(__file__).resolve().parents[3]  # student_resource/
+# src/ -> business_entity_resolution/ -> repository root
+BASE_DIR = Path(__file__).resolve().parents[2]
 TRAIN_DIR = BASE_DIR / "dataset" / "train"
 TEST_DIR  = BASE_DIR / "dataset" / "test"
 OUT_DIR   = BASE_DIR / "output"
@@ -157,7 +158,20 @@ def extract_name_bigrams(name: str) -> Set[str]:
 
 def load_source(path: Path) -> pd.DataFrame:
     log.info(f"Loading {path.name} ...")
+    # Repositories commonly store the large challenge files in Git LFS.  Failing
+    # explicitly here avoids the misleading one-column DataFrame that pandas
+    # produces when it is given an unhydrated LFS pointer.
+    with path.open(encoding="utf-8") as f:
+        if f.readline().startswith("version https://git-lfs.github.com/spec/"):
+            raise RuntimeError(
+                f"{path} is a Git LFS pointer, not the TSV data. "
+                "Install Git LFS and run `git lfs pull` before training."
+            )
     df = pd.read_csv(path, sep="\t", dtype=str).fillna("")
+    required = {"entity_id", "business_name", "business_address", "country"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
     df["norm_name"] = df["business_name"].apply(normalize_name)
     df["norm_addr"] = df["business_address"].apply(normalize_address)
     df["country"]   = df["country"].str.strip().str.lower()
@@ -173,8 +187,8 @@ def load_source(path: Path) -> pd.DataFrame:
 class BlockingPipeline:
     MAX_POSTING_LIST_SIZE = 500
     PREFIX_LEN = 4
-    TFIDF_TOP_K = 30
-    MAX_CANDIDATES_PER_S1 = 50
+    TFIDF_TOP_K = 50
+    MAX_CANDIDATES_PER_S1 = 80
 
     def __init__(self, s1: pd.DataFrame, s23: pd.DataFrame):
         self.s1  = s1.reset_index(drop=True)
@@ -255,14 +269,21 @@ class BlockingPipeline:
         for start in tqdm(range(0, n_s1, BATCH), desc="TF-IDF blocking"):
             end   = min(start + BATCH, n_s1)
             batch = s1_matrix[start:end]
-            sims  = (batch @ s23_T).toarray()
-            top_k = min(self.TFIDF_TOP_K, sims.shape[1])
-            top_indices = np.argpartition(sims, -top_k, axis=1)[:, -top_k:]
+            # Do not call .toarray(): with real challenge data that would create
+            # a multi-gigabyte dense matrix for every batch.  Sparse products
+            # retain only overlapping character n-grams, then we select top-k.
+            sims = (batch @ s23_T).tocsr()
             for bi, gi in enumerate(range(start, end)):
+                start_i, end_i = sims.indptr[bi], sims.indptr[bi + 1]
+                indices, values = sims.indices[start_i:end_i], sims.data[start_i:end_i]
+                if not len(values):
+                    continue
+                keep = min(self.TFIDF_TOP_K, len(values))
+                selected = np.argpartition(values, -keep)[-keep:]
                 s1_id = s1_ids[gi]
-                for j in top_indices[bi]:
-                    if sims[bi, j] > 0.05:
-                        candidates[s1_id].add(s23_ids[j])
+                for loc in selected:
+                    if values[loc] > 0.05:
+                        candidates[s1_id].add(s23_ids[indices[loc]])
         return candidates
 
     def generate_candidates(self) -> Dict[str, Set[str]]:
@@ -274,14 +295,31 @@ class BlockingPipeline:
 
         log.info("Merging candidates from all blocking strategies ...")
         all_candidates: Dict[str, Set[str]] = {}
+        # Build lookups once; repeated DataFrame boolean scans here turn candidate
+        # ranking into an accidental all-pairs operation.
+        s1_lookup = self.s1.set_index("entity_id")
+        s23_lookup = self.s23.set_index("entity_id")
         for s1_id in self.s1["entity_id"]:
             merged = (
                 cands_token.get(s1_id, set())
                 | cands_prefix.get(s1_id, set())
                 | cands_tfidf.get(s1_id, set())
             )
+            # Rank candidates by record evidence before truncation.  Truncating
+            # sorted IDs is unrelated to entity identity and can discard the true
+            # match, imposing a hard recall ceiling that no ML model can repair.
             if len(merged) > self.MAX_CANDIDATES_PER_S1:
-                merged = set(list(merged)[:self.MAX_CANDIDATES_PER_S1])
+                s1_row = s1_lookup.loc[s1_id]
+                scored = []
+                for candidate_id in merged:
+                    candidate = s23_lookup.loc[candidate_id]
+                    score = (
+                        0.60 * fuzz.token_set_ratio(s1_row["norm_name"], candidate["norm_name"])
+                        + 0.35 * fuzz.token_set_ratio(s1_row["norm_addr"], candidate["norm_addr"])
+                        + 5.0 * float(s1_row["country"] == candidate["country"])
+                    )
+                    scored.append((score, candidate_id))
+                merged = {candidate_id for _, candidate_id in sorted(scored, reverse=True)[:self.MAX_CANDIDATES_PER_S1]}
             all_candidates[s1_id] = merged
 
         total_cands = sum(len(v) for v in all_candidates.values())
@@ -346,6 +384,13 @@ def pairwise_features(s1_row: pd.Series, s23_row: pd.Series) -> np.ndarray:
     comb2 = n2 + " " + a2
     feats.append(fuzz.token_set_ratio(comb1, comb2) / 100.0)
 
+    # High-precision evidence.  These flags let the learner distinguish a true
+    # exact normalized field match from an otherwise similar common business.
+    feats.append(1.0 if n1 and n1 == n2 else 0.0)
+    feats.append(1.0 if a1 and a1 == a2 else 0.0)
+    feats.append(1.0 if nums1 and nums2 and nums1.isdisjoint(nums2) else 0.0)
+    feats.append(1.0 if n1.split() and n2.split() and n1.split()[0] == n2.split()[0] else 0.0)
+
     return np.array(feats, dtype=np.float32)
 
 
@@ -375,7 +420,7 @@ def build_feature_matrix(
             if ground_truth is not None:
                 y_rows.append(1 if s23_id in ground_truth.get(s1_id, set()) else 0)
 
-    X = np.array(X_rows, dtype=np.float32) if X_rows else np.empty((0, 16), dtype=np.float32)
+    X = np.array(X_rows, dtype=np.float32) if X_rows else np.empty((0, 20), dtype=np.float32)
     y = np.array(y_rows, dtype=np.int32)   if y_rows else np.array([], dtype=np.int32)
     pos_msg = f"Positives: {y.sum()}/{len(y)}" if len(y) > 0 else "Inference mode"
     log.info(f"Feature matrix: {X.shape[0]:,} pairs. {pos_msg}")
@@ -386,25 +431,22 @@ def build_feature_matrix(
 # 5. MODEL TRAINING & INFERENCE
 # ─────────────────────────────────────────────────────────────────
 
-def train_model(X: np.ndarray, y: np.ndarray) -> xgb.XGBClassifier:
-    log.info("Training XGBoost classifier ...")
+def train_model(X: np.ndarray, y: np.ndarray) -> HistGradientBoostingClassifier:
+    log.info("Training gradient-boosted classifier ...")
     pos = y.sum()
     neg = len(y) - pos
     scale_pos_weight = neg / max(pos, 1)
     log.info(f"  Class balance: {pos} positives, {neg} negatives")
-    model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        eval_metric="aucpr",
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0,
+    if pos == 0 or neg == 0:
+        raise ValueError("Training candidates must contain both positive and negative pairs.")
+    # sklearn's implementation is fast, CPU-only and avoids an unnecessary
+    # heavyweight XGBoost runtime in the submission container.
+    sample_weight = np.where(y == 1, scale_pos_weight, 1.0)
+    model = HistGradientBoostingClassifier(
+        max_iter=400, learning_rate=0.045, max_leaf_nodes=31,
+        min_samples_leaf=30, l2_regularization=2.0, random_state=42,
     )
-    model.fit(X, y)
+    model.fit(X, y, sample_weight=sample_weight)
     log.info("Training complete.")
     return model
 
@@ -439,7 +481,7 @@ def compute_macro_f05(
 
 
 def tune_threshold(
-    model: xgb.XGBClassifier,
+    model: HistGradientBoostingClassifier,
     X_val: np.ndarray,
     y_val: np.ndarray,
     pair_ids_val: List[Tuple[str, str]],
@@ -449,7 +491,7 @@ def tune_threshold(
     log.info("Tuning classification threshold ...")
     scores = model.predict_proba(X_val)[:, 1]
     best_f05, best_thresh = 0.0, 0.5
-    for thresh in np.arange(0.1, 0.95, 0.05):
+    for thresh in np.arange(0.30, 0.996, 0.01):
         preds: Dict[str, List[str]] = collections.defaultdict(list)
         for (s1_id, s23_id), score in zip(pair_ids_val, scores):
             if score >= thresh:
@@ -462,7 +504,7 @@ def tune_threshold(
 
 
 def predict_matches(
-    model: xgb.XGBClassifier,
+    model: HistGradientBoostingClassifier,
     X: np.ndarray,
     pair_ids: List[Tuple[str, str]],
     threshold: float,
@@ -545,14 +587,16 @@ def run_pipeline(mode: str = "test") -> None:
         # Load ground truth
         log.info("Loading ground truth ...")
         gt_df = pd.read_csv(gt_path, sep="\t", dtype=str).fillna("")
-        ground_truth: Dict[str, Set[str]] = {}
-        for _, row in gt_df.iterrows():
-            s1_id   = row["source1_entity_id"]
-            matched = row["matched_entity_ids"]
+        ground_truth: Dict[str, Set[str]] = {entity_id: set() for entity_id in all_s1_ids}
+        for row in gt_df.itertuples(index=False):
+            s1_id   = row.source1_entity_id
+            matched = row.matched_entity_ids
             ground_truth[s1_id] = set(matched.split(",")) if matched.strip() else set()
 
         # Train/val split
         all_keys = list(ground_truth.keys())
+        if len(all_keys) < 5:
+            raise ValueError("Validation mode requires at least 5 labelled Source-1 entities.")
         np.random.seed(42)
         np.random.shuffle(all_keys)
         split   = int(0.8 * len(all_keys))
@@ -572,6 +616,15 @@ def run_pipeline(mode: str = "test") -> None:
         # Val blocking
         blocker_val = BlockingPipeline(s1_val, s23)
         cands_val   = blocker_val.generate_candidates()
+        true_links = sum(len(matches) for matches in gt_val.values())
+        recovered_links = sum(
+            len(matches & cands_val.get(source_id, set()))
+            for source_id, matches in gt_val.items()
+        )
+        log.info(
+            "Validation blocking recall ceiling: %.4f (%s/%s true links reached the classifier)",
+            recovered_links / max(true_links, 1), recovered_links, true_links,
+        )
         X_val, y_val, pairs_val = build_feature_matrix(s1_val, s23, cands_val, gt_val)
 
         threshold = tune_threshold(
@@ -594,15 +647,20 @@ def run_pipeline(mode: str = "test") -> None:
         del s2_tr, s3_tr
 
         gt_df = pd.read_csv(TRAIN_DIR / "train_ground_truth.tsv", sep="\t", dtype=str).fillna("")
-        ground_truth_tr: Dict[str, Set[str]] = {}
-        for _, row in gt_df.iterrows():
-            s1_id   = row["source1_entity_id"]
-            matched = row["matched_entity_ids"]
+        ground_truth_tr: Dict[str, Set[str]] = {entity_id: set() for entity_id in s1_tr["entity_id"]}
+        for row in gt_df.itertuples(index=False):
+            s1_id   = row.source1_entity_id
+            matched = row.matched_entity_ids
             ground_truth_tr[s1_id] = set(matched.split(",")) if matched.strip() else set()
 
-        # Train blocking + features
+        # Train blocking + features.  The labelled positives are always included
+        # during fitting: otherwise a blocking miss would silently turn a known
+        # match into a negative training example.
         blocker_tr = BlockingPipeline(s1_tr, s23_tr)
         cands_tr   = blocker_tr.generate_candidates()
+        valid_train_ids = set(s23_tr["entity_id"])
+        for source_id, matched_ids in ground_truth_tr.items():
+            cands_tr.setdefault(source_id, set()).update(matched_ids & valid_train_ids)
         X_tr, y_tr, pairs_tr = build_feature_matrix(s1_tr, s23_tr, cands_tr, ground_truth_tr)
 
         # Quick val split for threshold tuning (20% of train)
@@ -612,15 +670,20 @@ def run_pipeline(mode: str = "test") -> None:
         split   = int(0.8 * len(all_keys))
         val_ids = set(all_keys[split:])
         pairs_val_filter = [(i, p) for i, p in enumerate(pairs_tr) if p[0] in val_ids]
-        if pairs_val_filter:
+        if pairs_val_filter and len(all_keys) >= 5:
             val_indices, pairs_val = zip(*pairs_val_filter)
             X_val_small = X_tr[list(val_indices)]
             gt_val_small = {k: v for k, v in ground_truth_tr.items() if k in val_ids}
-            model = train_model(X_tr, y_tr)
+            # Fit only on non-validation entities while selecting the threshold;
+            # this prevents validation leakage.  Refit on all pairs afterwards.
+            train_indices = [i for i, p in enumerate(pairs_tr) if p[0] not in val_ids]
+            if not train_indices:
+                raise ValueError("No training pairs remain after validation split.")
+            model_for_threshold = train_model(X_tr[train_indices], y_tr[train_indices])
             all_val_ids_small = set(p[0] for p in pairs_val) | val_ids
             # Compute scores only for threshold tuning (no y_val needed for F05)
             threshold = tune_threshold(
-                model,
+                model_for_threshold,
                 X_val_small,
                 np.array([1 if p[1] in ground_truth_tr.get(p[0], set()) else 0 for p in pairs_val]),
                 list(pairs_val),
@@ -628,8 +691,9 @@ def run_pipeline(mode: str = "test") -> None:
                 all_val_ids_small,
             )
         else:
-            model = train_model(X_tr, y_tr)
             threshold = 0.5
+        # Final production model sees all labelled data after threshold selection.
+        model = train_model(X_tr, y_tr)
         del s1_tr, s23_tr, X_tr, y_tr
 
         # Generate candidates for test data
